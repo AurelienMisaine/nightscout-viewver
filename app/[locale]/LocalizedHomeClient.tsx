@@ -20,6 +20,7 @@ import {
   NightscoutTreatment,
   NightscoutProfile,
 } from "@/types/nightscout";
+import { normalizeTrio } from "@/lib/trioAggregation";
 import { SendToMyDiabbyCard } from "@/components/dashboard/SendToMyDiabbyCard";
 import { AIAnalysisCard } from "@/components/dashboard/AIAnalysisCard";
 import { isDemoMode } from "@/lib/demoData";
@@ -106,7 +107,7 @@ function LocalizedHomeClientContent({ locale }: LocalizedHomeClientProps) {
             NightscoutProfile
           ]) => {
             setData(entries);
-            setTreatments(treatments);
+            setTreatments(normalizeTrio(treatments));
             setProfil(profil);
             setLoading(false);
             console.log("entries", entries);
