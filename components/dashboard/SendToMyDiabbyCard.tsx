@@ -8,6 +8,7 @@ import Image from "next/image";
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Checkbox } from "@/components/ui/checkbox";
+import { manualBoluses, hourlySMB, hourlyBasal, localDateTime, AggItem } from "@/lib/trioAggregation";
 
 // Ajout du type pour les entrées MyDiabby
 interface MyDiabbyGlycemiaEntry {
@@ -210,23 +211,12 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
     const data = await response.json();
     // On ne garde que les bolus
     return (data.data?.glycemia || []).filter(
-      (g: MyDiabbyGlycemiaEntry) => g.insulin && g.insulin.bolus
+      (g: MyDiabbyGlycemiaEntry) => g.insulin && (g.insulin.bolus || g.insulin.bolus_corr)
     );
   }
 
   // Fonction de comparaison (bolus local <-> bolus MyDiabby)
-  function isSameBolus(local: NightscoutTreatment, remote: MyDiabbyGlycemiaEntry) {
-    const localDate = new Date(local.date);
-    const localDateStr = localDate.toISOString().slice(0, 10);
-    const localTimeStr = localDate.toTimeString().slice(0, 5);
-    const localDose = Number(local.insulin);
-    const remoteDose = Number(remote.insulin?.bolus);
-    return (
-      remote.date === localDateStr &&
-      remote.time === localTimeStr &&
-      Math.abs(remoteDose - localDose) < 0.001
-    );
-  }
+
 
   // Fonction pour récupérer les basals déjà présents sur MyDiabby
   async function fetchMyDiabbyBasal(token: string) {
@@ -251,18 +241,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
   }
 
   // Fonction de comparaison (basal local <-> basal MyDiabby)
-  function isSameBasal(local: NightscoutTreatment, remote: MyDiabbyGlycemiaEntry) {
-    const localDate = new Date(local.date);
-    const localDateStr = localDate.toISOString().slice(0, 10);
-    const localTimeStr = localDate.toTimeString().slice(0, 5);
-    const localDose = Number(local.rate);
-    const remoteDose = Number(remote.insulin?.basal);
-    return (
-      remote.date === localDateStr &&
-      remote.time === localTimeStr &&
-      Math.abs(remoteDose - localDose) < 0.001
-    );
-  }
+
 
   // Fonction pour récupérer les glycémies déjà présentes sur MyDiabby
   async function fetchMyDiabbyGlycemia(token: string) {
@@ -288,9 +267,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
 
   // Fonction de comparaison (glycémie locale <-> glycémie MyDiabby)
   function isSameGlycemia(local: NightscoutEntry, remote: MyDiabbyGlycemiaEntry) {
-    const localDate = new Date(local.date);
-    const localDateStr = localDate.toISOString().slice(0, 10);
-    const localTimeStr = localDate.toTimeString().slice(0, 5);
+    const { date: localDateStr, time: localTimeStr } = localDateTime(new Date(local.date).getTime());
     const localValue = (local.sgv / 100).toFixed(4);
     const remoteValue = remote.glycemia?.value ? Number(remote.glycemia.value) : NaN;
     return (
@@ -387,23 +364,18 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
             (entry) => !mydiabbyGlycemiaList.some((remote: MyDiabbyGlycemiaEntry) => isSameGlycemia(entry, remote))
           )
         : [];
-      const bolusTreatments = (sendBolus && treatments)
-        ? treatments.filter(
-            (entry) =>
-              (entry.eventType === "Meal Bolus" || entry.eventType === "Correction Bolus") &&
-              typeof entry.insulin === 'number' && entry.date
-          )
-        : [];
-      const bolusToSend = bolusTreatments.filter(
-        (local) => !mydiabbyBolusList.some((remote: MyDiabbyGlycemiaEntry) => isSameBolus(local, remote))
+      // Trio : bolus manuels tels quels, SMB sommés par heure, basal délivrée par heure
+      const sameAs = (item: AggItem, r: MyDiabbyGlycemiaEntry, field: "bolus" | "basal") => {
+        const v = field === "basal" ? r.insulin?.basal : (r.insulin?.bolus ?? r.insulin?.bolus_corr);
+        return r.date === item.date && r.time === item.time && Math.abs(Number(v) - item.units) < 0.001;
+      };
+      const manual = sendBolus && treatments ? manualBoluses(treatments) : { items: [], unmatchedCarbs: 0 };
+      const smbHourly = sendBolus && treatments ? hourlySMB(treatments) : [];
+      const bolusToSend = [...manual.items, ...smbHourly].filter(
+        (item) => !mydiabbyBolusList.some((r: MyDiabbyGlycemiaEntry) => sameAs(item, r, "bolus"))
       );
-      const basalTreatments = (sendBasal && treatments)
-        ? treatments.filter(
-            (entry) => entry.eventType === "Temp Basal" && typeof entry.rate === 'number' && entry.date
-          )
-        : [];
-      const basalToSend = basalTreatments.filter(
-        (local) => !mydiabbyBasalList.some((remote: MyDiabbyGlycemiaEntry) => isSameBasal(local, remote))
+      const basalToSend = (sendBasal && treatments ? hourlyBasal(treatments) : []).filter(
+        (item) => !mydiabbyBasalList.some((r: MyDiabbyGlycemiaEntry) => sameAs(item, r, "basal"))
       );
 
       totalSteps = glycemiaToSend.length + bolusToSend.length + basalToSend.length;
@@ -417,9 +389,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
       if (glycemiaToSend.length > 0) {
         await runWithConcurrency(glycemiaToSend, CONCURRENCY, async (entry) => {
           if (cancelRef.current) throw new Error("Envoi interrompu par l'utilisateur.");
-          const dateObj = new Date(entry.date);
-          const date = dateObj.toISOString().slice(0, 10);
-          const time = dateObj.toTimeString().slice(0, 5);
+          const { date, time } = localDateTime(new Date(entry.date).getTime());
           const glycemia = (entry.sgv / 100).toFixed(4);
           await sendGlycemiaToMyDiabby({ token, glycemia, date, time });
           bumpProgress();
@@ -428,39 +398,15 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
 
       // 2. Bolus (avec déduplication + concurrence)
       if (bolusToSend.length > 0) {
-        await runWithConcurrency(bolusToSend, CONCURRENCY, async (entry) => {
+        await runWithConcurrency(bolusToSend, CONCURRENCY, async (item) => {
           if (cancelRef.current) throw new Error("Envoi interrompu par l'utilisateur.");
-          const dateObj = new Date(entry.date);
-          const date = dateObj.toISOString().slice(0, 10);
-          const time = dateObj.toTimeString().slice(0, 5);
-          const bolus = typeof entry.insulin === 'number' ? entry.insulin.toFixed(4) : "0.0000";
-          // Associer les glucides si possible (logique précédente)
-          let carbs: string | undefined = undefined;
-          if (entry.identifier) {
-            const carbsEntry = treatments.find(
-              (t) => t.carbs && t.identifier && t.identifier === entry.identifier
-            );
-            if (carbsEntry && typeof carbsEntry.carbs === "number") {
-              carbs = carbsEntry.carbs.toString();
-            }
-          } else {
-            const entryDate = new Date(entry.date).getTime();
-            const carbsEntry = treatments.find(
-              (t) =>
-                t.carbs &&
-                Math.abs(new Date(t.date).getTime() - entryDate) < 5 * 60 * 1000
-            );
-            if (carbsEntry && typeof carbsEntry.carbs === "number") {
-              carbs = carbsEntry.carbs.toString();
-            }
-          }
           await sendBolusToMyDiabby({
             token,
-            bolus,
-            date,
-            time,
-            isCorrection: entry.eventType === "Correction Bolus",
-            carbs,
+            bolus: item.units.toFixed(4),
+            date: item.date,
+            time: item.time,
+            isCorrection: item.isCorrection,
+            carbs: item.carbs !== undefined ? String(item.carbs) : undefined,
           });
           bumpProgress();
         });
@@ -468,17 +414,18 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
 
       // 3. Basals temporaires (avec déduplication + concurrence)
       if (basalToSend.length > 0) {
-        await runWithConcurrency(basalToSend, CONCURRENCY, async (entry) => {
+        await runWithConcurrency(basalToSend, CONCURRENCY, async (item) => {
           if (cancelRef.current) throw new Error("Envoi interrompu par l'utilisateur.");
-          const dateObj = new Date(entry.date);
-          const date = dateObj.toISOString().slice(0, 10);
-          const time = dateObj.toTimeString().slice(0, 5);
-          const basal = typeof entry.rate === 'number' ? entry.rate.toFixed(4) : "0.0000";
-          await sendBasalToMyDiabby({ token, basal, date, time });
+          await sendBasalToMyDiabby({ token, basal: item.units.toFixed(4), date: item.date, time: item.time });
           bumpProgress();
         });
       }
-      setStatus("Envoi terminé !");
+      setStatus(
+        "Envoi terminé !" +
+          (manual.unmatchedCarbs > 0
+            ? ` (${manual.unmatchedCarbs} saisie(s) de glucides sans bolus à ±30 min, non envoyée(s))`
+            : "")
+      );
       setCancelRequested(false);
       cancelRef.current = false;
     } catch (e: unknown) {
