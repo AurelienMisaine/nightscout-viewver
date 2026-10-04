@@ -24,6 +24,10 @@ export const SCHEDULED_BASAL: [number, number][] = [
 const H = 3600_000;
 const MIN_CARB_MATCH = 30 * 60_000;
 
+/** Type d'origine Trio (conservé par normalizeTrio). */
+export const kind = (t: NightscoutTreatment) =>
+  (t as NightscoutTreatment & { trioEventType?: string }).trioEventType ?? t.eventType;
+
 export function tsOf(t: Partial<NightscoutTreatment>): number {
   return new Date(t.date || t.created_at || t.timestamp || "").getTime();
 }
@@ -51,13 +55,13 @@ const r2 = (x: number) => Math.round(x * 100) / 100;
 /** Glucides saisis par l'utilisateur (exclut les équivalents FPU générés par Trio, sans clé foodType). */
 function userCarbs(ts: NightscoutTreatment[]) {
   return ts.filter((t) => typeof t.carbs === "number" && t.carbs > 0 &&
-    t.eventType !== "Bolus" && t.eventType !== "SMB" && t.eventType !== "Temp Basal" &&
+    !["Bolus", "SMB", "Temp Basal", "Meal Bolus", "Correction Bolus"].includes(kind(t)) &&
     "foodType" in (t as object));
 }
 
-export function manualBoluses(ts: NightscoutTreatment[]): { items: AggItem[]; unmatchedCarbs: number } {
+export function manualBoluses(ts: NightscoutTreatment[]): { items: AggItem[]; unmatchedCarbs: number; mealIds: Set<string> } {
   const boluses = ts
-    .filter((t) => ["Bolus", "Meal Bolus", "Correction Bolus"].includes(t.eventType) &&
+    .filter((t) => ["Bolus", "Meal Bolus", "Correction Bolus"].includes(kind(t)) &&
       typeof t.insulin === "number" && t.insulin > 0)
     .sort((a, b) => tsOf(a) - tsOf(b));
   const carbs = userCarbs(ts).map((c) => ({ ms: tsOf(c), g: c.carbs as number }));
@@ -79,10 +83,11 @@ export function manualBoluses(ts: NightscoutTreatment[]): { items: AggItem[]; un
       ...localDateTime(tsOf(b)),
       units: r2(b.insulin as number),
       carbs: j === undefined ? undefined : carbs[j].g,
-      isCorrection: b.eventType === "Correction Bolus" || (j === undefined && b.eventType !== "Meal Bolus"),
+      isCorrection: kind(b) === "Correction Bolus" || (j === undefined && kind(b) !== "Meal Bolus"),
     };
   });
-  return { items, unmatchedCarbs: carbs.length - usedCarb.size };
+  const mealIds = new Set([...carbOf.keys()].map((i) => boluses[i]._id));
+  return { items, unmatchedCarbs: carbs.length - usedCarb.size, mealIds };
 }
 
 /** Bornes des heures complètes couvertes par les données (exclut l'heure en cours). */
@@ -100,7 +105,7 @@ export function hourlySMB(ts: NightscoutTreatment[], nowMs = Date.now()): AggIte
   const hours = new Set(completeHours(ts, nowMs));
   const sums = new Map<number, number>();
   for (const t of ts) {
-    if (t.eventType !== "SMB" || typeof t.insulin !== "number") continue;
+    if (kind(t) !== "SMB" || typeof t.insulin !== "number") continue;
     const h = startOfHour(tsOf(t));
     if (hours.has(h)) sums.set(h, (sums.get(h) || 0) + t.insulin);
   }
@@ -131,4 +136,39 @@ export function hourlyBasal(ts: NightscoutTreatment[], nowMs = Date.now()): AggI
     }
     return { ...localDateTime(h), units: r2(units) };
   });
+}
+
+/**
+ * Adapte les traitements Trio au format attendu par l'affichage DiabExplorer :
+ * - `date` <- created_at ; `identifier` <- id
+ * - Bolus -> "Meal Bolus" (glucides à ±30 min) ou "Correction Bolus" ; SMB -> "Correction Bolus"
+ *   (type d'origine conservé dans `trioEventType`)
+ * - glucides FPU générés par Trio retirés de l'affichage (gardés dans `fpuCarbs`)
+ * - durée des Temp Basal ramenée à leur durée effective (Trio en relance un toutes les ~5 min)
+ */
+export function normalizeTrio(ts: NightscoutTreatment[]): NightscoutTreatment[] {
+  const { mealIds } = manualBoluses(ts);
+  const out = ts.map((t) => {
+    const raw = t as NightscoutTreatment & { id?: string; trioEventType?: string; fpuCarbs?: number };
+    const n = { ...raw, date: t.date || t.created_at || t.timestamp, identifier: t.identifier ?? raw.id ?? t._id };
+    if (t.eventType === "Bolus") {
+      n.trioEventType = "Bolus";
+      n.eventType = mealIds.has(t._id) ? "Meal Bolus" : "Correction Bolus";
+    } else if (t.eventType === "SMB") {
+      n.trioEventType = "SMB";
+      n.eventType = "Correction Bolus";
+    }
+    if (typeof t.carbs === "number" && t.carbs > 0 && t.eventType === "Carb Correction" && !("foodType" in raw)) {
+      n.fpuCarbs = t.carbs;
+      n.carbs = undefined;
+    }
+    if (t.eventType === "Bolus" || t.eventType === "SMB") n.carbs = undefined;
+    return n;
+  });
+  const temps = out.filter((t) => t.eventType === "Temp Basal").sort((a, b) => tsOf(a) - tsOf(b));
+  for (let i = 0; i < temps.length - 1; i++) {
+    const gapMin = (tsOf(temps[i + 1]) - tsOf(temps[i])) / 60_000;
+    temps[i].duration = Math.max(0, Math.min(temps[i].duration || 0, gapMin));
+  }
+  return out;
 }
