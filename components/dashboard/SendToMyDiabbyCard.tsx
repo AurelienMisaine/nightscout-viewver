@@ -47,7 +47,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
   const [openSendModal, setOpenSendModal] = useState(false);
   const [sendGlycemia, setSendGlycemia] = useState(true);
   const [sendBolus, setSendBolus] = useState(true);
-  const [sendBasal, setSendBasal] = useState(false);
+  const [sendBasal, setSendBasal] = useState(true);
 
   // Charger depuis localStorage au montage
   useEffect(() => {
@@ -142,7 +142,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
       body: body.toString(),
     });
     if (!response.ok) {
-      throw new Error(t('SendToMyDiabbyCard.send_api_error'));
+      throw new Error(`${t('SendToMyDiabbyCard.send_api_error')} (HTTP ${response.status})`);
     }
     return response.json();
   }
@@ -188,7 +188,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
       body: body.toString(),
     });
     if (!response.ok) {
-      throw new Error("Erreur lors de l'envoi du bolus à MyDiabby");
+      throw new Error(`Erreur lors de l'envoi du bolus à MyDiabby (HTTP ${response.status})`);
     }
     return response.json();
   }
@@ -326,14 +326,17 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
       body: body.toString(),
     });
     if (!response.ok) {
-      throw new Error("Erreur lors de l'envoi du basal temporaire à MyDiabby");
+      throw new Error(`Erreur lors de l'envoi du basal temporaire à MyDiabby (HTTP ${response.status})`);
     }
     return response.json();
   }
 
   // Handler global pour l'envoi groupé
-  // Concurrence mesurée : le serveur MyDiabby encaisse 20 POST simultanés sans erreur.
-  const CONCURRENCY = 20;
+  // 5 envois simultanés : 20 provoquait des refus ponctuels de MyDiabby.
+  const CONCURRENCY = 5;
+  // Délais avant chaque nouvel essai d'une entrée refusée (2 essais supplémentaires)
+  const RETRY_DELAYS_MS = [1000, 3000];
+  const CANCEL_MSG = "Envoi interrompu par l'utilisateur.";
 
   const handleSendAll = async () => {
     setStatus(null);
@@ -348,6 +351,25 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
       const bumpProgress = () => {
         doneSteps++;
         setProgress(Math.round((doneSteps / totalSteps) * 100));
+      };
+      // Une entrée refusée n'arrête plus l'envoi : on réessaie, puis on la note et on continue.
+      const failures: string[] = [];
+      const attempt = async (label: string, send: () => Promise<unknown>) => {
+        let lastError = "";
+        for (let i = 0; i <= RETRY_DELAYS_MS.length; i++) {
+          if (cancelRef.current) throw new Error(CANCEL_MSG);
+          try {
+            await send();
+            bumpProgress();
+            return;
+          } catch (e: unknown) {
+            lastError = e instanceof Error ? e.message : String(e);
+            if (i < RETRY_DELAYS_MS.length) await new Promise((res) => setTimeout(res, RETRY_DELAYS_MS[i]));
+          }
+        }
+        failures.push(`${label} — ${lastError}`);
+        console.error("MyDiabby : entrée refusée", label, lastError);
+        bumpProgress();
       };
 
       // Récupère l'existant UNE seule fois (au lieu de 2x par type avant)
@@ -388,42 +410,47 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
       // 1. Glycémies (dédupliquées, envoyées individuellement en concurrence — le batch multi-valeurs n'est pas supporté par l'API)
       if (glycemiaToSend.length > 0) {
         await runWithConcurrency(glycemiaToSend, CONCURRENCY, async (entry) => {
-          if (cancelRef.current) throw new Error("Envoi interrompu par l'utilisateur.");
           const { date, time } = localDateTime(new Date(entry.date).getTime());
           const glycemia = (entry.sgv / 100).toFixed(4);
-          await sendGlycemiaToMyDiabby({ token, glycemia, date, time });
-          bumpProgress();
+          await attempt(`Glycémie ${date} ${time} (${entry.sgv} mg/dL)`, () =>
+            sendGlycemiaToMyDiabby({ token, glycemia, date, time })
+          );
         });
       }
 
       // 2. Bolus (avec déduplication + concurrence)
       if (bolusToSend.length > 0) {
         await runWithConcurrency(bolusToSend, CONCURRENCY, async (item) => {
-          if (cancelRef.current) throw new Error("Envoi interrompu par l'utilisateur.");
-          await sendBolusToMyDiabby({
-            token,
-            bolus: item.units.toFixed(4),
-            date: item.date,
-            time: item.time,
-            isCorrection: item.isCorrection,
-            carbs: item.carbs !== undefined ? String(item.carbs) : undefined,
-          });
-          bumpProgress();
+          await attempt(
+            `Bolus ${item.date} ${item.time} (${item.units.toFixed(2)} U${item.carbs !== undefined ? `, ${item.carbs} g` : ""})`,
+            () =>
+              sendBolusToMyDiabby({
+                token,
+                bolus: item.units.toFixed(4),
+                date: item.date,
+                time: item.time,
+                isCorrection: item.isCorrection,
+                carbs: item.carbs !== undefined ? String(item.carbs) : undefined,
+              })
+          );
         });
       }
 
       // 3. Basals temporaires (avec déduplication + concurrence)
       if (basalToSend.length > 0) {
         await runWithConcurrency(basalToSend, CONCURRENCY, async (item) => {
-          if (cancelRef.current) throw new Error("Envoi interrompu par l'utilisateur.");
-          await sendBasalToMyDiabby({ token, basal: item.units.toFixed(4), date: item.date, time: item.time });
-          bumpProgress();
+          await attempt(`Basal ${item.date} ${item.time} (${item.units.toFixed(2)} U)`, () =>
+            sendBasalToMyDiabby({ token, basal: item.units.toFixed(4), date: item.date, time: item.time })
+          );
         });
       }
+      const sent = totalSteps - failures.length;
       setStatus(
-        "Envoi terminé !" +
+        (failures.length === 0
+          ? `Envoi terminé ! (${sent} entrée(s) envoyée(s))`
+          : `Envoi terminé avec ${failures.length} refus sur ${totalSteps} (après 3 essais) :\n- ${failures.join("\n- ")}`) +
           (manual.unmatchedCarbs > 0
-            ? ` (${manual.unmatchedCarbs} saisie(s) de glucides sans bolus à ±30 min, non envoyée(s))`
+            ? `\n(${manual.unmatchedCarbs} saisie(s) de glucides sans bolus à ±30 min, non envoyée(s))`
             : "")
       );
       setCancelRequested(false);
@@ -574,7 +601,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
             )}
           </>
         )}
-        {status && <div className="mt-2 text-sm text-center">{status}</div>}
+        {status && <div className="mt-2 text-sm text-center whitespace-pre-line">{status}</div>}
           </>
         )}
       </CardContent>
