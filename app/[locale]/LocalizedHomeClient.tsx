@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Header } from "@/components/dashboard/Header";
 import { StatsGrid } from "@/components/dashboard/StatsGrid";
-import { GlucoseTrendChart } from "@/components/dashboard/GlucoseTrendChart";
+import { LoopDayChart } from "@/components/dashboard/LoopDayChart";
 import { DateRange } from "react-day-picker";
 import { DailyStats } from "@/components/dashboard/DailyStats";
 import { ShareLinks } from "@/components/dashboard/ShareLinks";
@@ -186,7 +186,7 @@ function LocalizedHomeClientContent({ locale }: LocalizedHomeClientProps) {
             <StatsGrid data={data} />
             <div className="grid gap-6 grid-cols-1 lg:grid-cols-3">
               <div className="lg:col-span-2 min-w-0">
-                <GlucoseTrendChart
+                <LoopDayChart
                   data={data}
                   treatments={treatments}
                   selectedDate={selectedDate}
