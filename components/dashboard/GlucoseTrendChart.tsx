@@ -1,4 +1,5 @@
 "use client";
+import { useEffect } from "react";
 
 import {
   LineChart,
@@ -69,8 +70,8 @@ export function GlucoseTrendChart({ data, treatments, selectedDate, setSelectedD
   const minDate = availableDates.length ? new Date(availableDates[0]) : null;
   const maxDate = availableDates.length ? new Date(availableDates[availableDates.length - 1]) : null;
 
-  const isPrevDisabled = !!minDate && selectedDate.getTime() <= minDate.getTime();
-  const isNextDisabled = !!maxDate && selectedDate.getTime() >= maxDate.getTime();
+  const isPrevDisabled = !!minDate && new Date(selectedDate).setHours(0, 0, 0, 0) <= minDate.getTime();
+  const isNextDisabled = !!maxDate && new Date(selectedDate).setHours(0, 0, 0, 0) >= maxDate.getTime();
 
   // Ticks horaires fixes pour l'axe X (00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00, 24:00)
   const hourTicks = ["00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00", "24:00"];
@@ -130,23 +131,24 @@ export function GlucoseTrendChart({ data, treatments, selectedDate, setSelectedD
     .filter(Boolean)
     .sort((a, b) => (a!.date - b!.date));
 
-  // Gestion des jours précédent/suivant
+  // Gestion des jours précédent/suivant : saute au jour disponible le plus proche (trous tolérés)
+  const selectedDayTs = new Date(selectedDate).setHours(0, 0, 0, 0);
   const goToPreviousDay = () => {
-    const prev = new Date(selectedDate);
-    prev.setDate(prev.getDate() - 1);
-    prev.setHours(0, 0, 0, 0);
-    if (availableDates.includes(prev.getTime())) {
-      setSelectedDate(prev);
-    }
+    const prev = [...availableDates].reverse().find((d) => d < selectedDayTs);
+    if (prev !== undefined) setSelectedDate(new Date(prev));
   };
   const goToNextDay = () => {
-    const next = new Date(selectedDate);
-    next.setDate(next.getDate() + 1);
-    next.setHours(0, 0, 0, 0);
-    if (availableDates.includes(next.getTime())) {
-      setSelectedDate(next);
-    }
+    const next = availableDates.find((d) => d > selectedDayTs);
+    if (next !== undefined) setSelectedDate(new Date(next));
   };
+
+  // Si le jour affiché sort de la période chargée (changement de période en haut),
+  // on se place sur le dernier jour disponible de la période.
+  const lastAvailable = availableDates.length ? availableDates[availableDates.length - 1] : null;
+  const selectedIsAvailable = availableDates.includes(selectedDayTs);
+  useEffect(() => {
+    if (lastAvailable !== null && !selectedIsAvailable) setSelectedDate(new Date(lastAvailable));
+  }, [lastAvailable, selectedIsAvailable, setSelectedDate]);
 
   const INSULIN_SCALE_FACTOR = 5;
   const CARBS_SCALE_FACTOR = 0.8;
