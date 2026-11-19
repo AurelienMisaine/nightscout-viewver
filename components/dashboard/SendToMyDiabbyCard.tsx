@@ -45,7 +45,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
 
   // État pour la modale d'envoi groupé
   const [openSendModal, setOpenSendModal] = useState(false);
-  const [sendGlycemia, setSendGlycemia] = useState(true);
+  const [sendGlycemia, setSendGlycemia] = useState(false); // glycémie déjà reçue par myDiabby via Dexcom
   const [sendBolus, setSendBolus] = useState(true);
   const [sendBasal, setSendBasal] = useState(true);
 
