@@ -74,8 +74,9 @@ function LocalizedHomeClientContent({ locale }: LocalizedHomeClientProps) {
   useEffect(() => {
     if (url && date?.from && date?.to) {
       setLoading(true);
-      const from = date.from.getTime();
-      const to = date.to.getTime();
+      // Bornes en jours entiers : le dernier jour choisi est inclus jusqu'à 23:59
+      const from = new Date(date.from).setHours(0, 0, 0, 0);
+      const to = new Date(date.to).setHours(23, 59, 59, 999);
       const token = localStorage.getItem("nightscoutToken");
 
       // Appel via le proxy API Next.js pour éviter les blocages CORS côté Nightscout
