@@ -172,3 +172,97 @@ export function normalizeTrio(ts: NightscoutTreatment[]): NightscoutTreatment[] 
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Évènements de boucle (Tai/Trio) -> repas, sport et remarques MyDiabby
+// ---------------------------------------------------------------------------
+
+export interface LoopEvent {
+  date: string;
+  time: string;
+  kind: "meal" | "sport" | "note";
+  description: string;
+  durationMin?: number;
+}
+
+type TT = NightscoutTreatment & { targetBottom?: number; targetTop?: number };
+const MIN = 60_000;
+const MIN_EVENT_MIN = 5; // en dessous : activations en double / annulées, ignorées
+const MEAL_CLUSTER_MIN = 15; // activations successives de la cible 80 = un seul repas
+const BUTTON_BOLUS_BEFORE_MIN = 2; // le bolus du bouton part à l'activation de la cible 80
+const BUTTON_BOLUS_AFTER_MIN = 3;
+const GENERIC_NOTES = /^(temp target|custom target)$/i;
+
+const label = (t: NightscoutTreatment) => (t.notes || "").trim();
+const fmtU = (u: number) => `${Number.isInteger(u) ? u : u.toFixed(1)} U`;
+
+export function loopEvents(ts: NightscoutTreatment[]): LoopEvent[] {
+  const out: LoopEvent[] = [];
+  const at = (ms: number) => localDateTime(ms);
+  const byTime = (a: NightscoutTreatment, b: NightscoutTreatment) => tsOf(a) - tsOf(b);
+
+  const targets = ts.filter((t) => t.eventType === "Temporary Target").sort(byTime) as TT[];
+  const overrides = ts.filter((t) => t.eventType === "Exercise").sort(byTime);
+  const manual = ts.filter((t) => kind(t) === "Bolus" && typeof t.insulin === "number");
+  const isMealOverride = (t: NightscoutTreatment) => /repas/i.test(label(t));
+  const isSportOverride = (t: NightscoutTreatment) => /sport/i.test(label(t));
+
+  // Durée effective d'une dérogation : jusqu'à la dérogation suivante si elle arrive avant la fin
+  const effective = (list: NightscoutTreatment[], i: number) => {
+    const start = tsOf(list[i]);
+    const next = list.slice(i + 1).find((o) => tsOf(o) > start);
+    const end = Math.min(start + (list[i].duration || 0) * MIN, next ? tsOf(next) : Infinity);
+    return Math.round((end - start) / MIN);
+  };
+
+  // 1. Repas = activation(s) de la cible 80 (bouton raccourci)
+  const meals: { start: number; last: number; maxDur: number }[] = [];
+  for (const t of targets.filter((t) => t.targetBottom === 80)) {
+    const ms = tsOf(t);
+    const cur = meals[meals.length - 1];
+    if (cur && ms - cur.last <= MEAL_CLUSTER_MIN * MIN) {
+      cur.last = ms;
+      cur.maxDur = Math.max(cur.maxDur, t.duration || 0);
+    } else meals.push({ start: ms, last: ms, maxDur: t.duration || 0 });
+  }
+  const usedMealOverrides = new Set<string>();
+  for (const m of meals.filter((m) => m.maxDur >= MIN_EVENT_MIN)) {
+    const bolus = manual
+      .filter((b) => tsOf(b) >= m.start - BUTTON_BOLUS_BEFORE_MIN * MIN && tsOf(b) <= m.last + BUTTON_BOLUS_AFTER_MIN * MIN)
+      .reduce((s, b) => s + (b.insulin as number), 0);
+    const derogIdx = overrides.findIndex(
+      (o) => isMealOverride(o) && (o.duration || 0) >= MIN_EVENT_MIN && Math.abs(tsOf(o) - m.start) <= MEAL_CLUSTER_MIN * MIN
+    );
+    let desc = bolus > 0 ? `Repas – bouton : ${fmtU(bolus)} + cible 80` : "Repas – bouton : cible 80 seule, sans bolus";
+    if (derogIdx >= 0) {
+      usedMealOverrides.add(overrides[derogIdx]._id);
+      desc += ` + dérogation repas (${effective(overrides, derogIdx)} min)`;
+    }
+    out.push({ ...at(m.start), kind: "meal", description: desc + " – boucle sans annonce de glucides" });
+  }
+
+  // 2. Dérogations
+  overrides.forEach((o, i) => {
+    if ((o.duration || 0) < MIN_EVENT_MIN || usedMealOverrides.has(o._id)) return;
+    const dur = effective(overrides, i);
+    if (dur < MIN_EVENT_MIN) return;
+    if (isSportOverride(o)) {
+      out.push({ ...at(tsOf(o)), kind: "sport", description: `Dérogation ${label(o)}`, durationMin: dur });
+    } else if (isMealOverride(o)) {
+      out.push({ ...at(tsOf(o)), kind: "meal", description: `Repas – dérogation repas seule (${dur} min) – boucle sans annonce de glucides` });
+    } else {
+      out.push({ ...at(tsOf(o)), kind: "note", description: `Dérogation ${label(o) || "sans nom"} (${dur} min)` });
+    }
+  });
+
+  // 3. Autres cibles temporaires -> remarques
+  targets.forEach((t, i) => {
+    if (t.targetBottom === 80 || (t.duration || 0) < MIN_EVENT_MIN) return;
+    const dur = effective(targets, i);
+    if (dur < MIN_EVENT_MIN) return;
+    const name = label(t) && !GENERIC_NOTES.test(label(t)) ? ` – ${label(t)}` : "";
+    out.push({ ...at(tsOf(t)), kind: "note", description: `Cible temporaire ${t.targetBottom} mg/dL${name} (${dur} min)` });
+  });
+
+  return out.sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+}

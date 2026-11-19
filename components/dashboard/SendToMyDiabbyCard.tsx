@@ -8,7 +8,7 @@ import Image from "next/image";
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Checkbox } from "@/components/ui/checkbox";
-import { manualBoluses, hourlySMB, hourlyBasal, localDateTime, AggItem } from "@/lib/trioAggregation";
+import { manualBoluses, hourlySMB, hourlyBasal, localDateTime, AggItem, loopEvents, LoopEvent } from "@/lib/trioAggregation";
 
 // Ajout du type pour les entrées MyDiabby
 interface MyDiabbyGlycemiaEntry {
@@ -27,7 +27,10 @@ interface MyDiabbyGlycemiaEntry {
   };
   meal?: {
     carb?: string;
+    description?: string;
   };
+  sport?: { description?: string };
+  context?: { description?: string };
   // Ajoutez d'autres champs si besoin
 }
 
@@ -48,6 +51,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
   const [sendGlycemia, setSendGlycemia] = useState(false); // glycémie déjà reçue par myDiabby via Dexcom
   const [sendBolus, setSendBolus] = useState(true);
   const [sendBasal, setSendBasal] = useState(true);
+  const [sendEvents, setSendEvents] = useState(true);
 
   // Charger depuis localStorage au montage
   useEffect(() => {
@@ -331,6 +335,47 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
     return response.json();
   }
 
+  // Repas (bouton / dérogation repas), sport et remarques (cibles temporaires, autres dérogations)
+  async function sendEventToMyDiabby(token: string, ev: LoopEvent) {
+    const fields: Record<string, string> =
+      ev.kind === "meal"
+        ? { "meal[description]": ev.description }
+        : ev.kind === "sport"
+        ? {
+            "sport[description]": ev.description,
+            "sport[duration_hour]": String(Math.floor((ev.durationMin || 0) / 60)),
+            "sport[duration_minute]": String((ev.durationMin || 0) % 60),
+          }
+        : { "context[description]": ev.description };
+    const body = new URLSearchParams({ time: ev.time, date: ev.date, add: "true", dgnew: "false", ...fields });
+    const response = await fetch("https://app.mydiabby.com/api/data", {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "X-locale": "fr",
+      },
+      credentials: "include",
+      body: body.toString(),
+    });
+    if (!response.ok) {
+      throw new Error(`Erreur lors de l'envoi de l'évènement à MyDiabby (HTTP ${response.status})`);
+    }
+    return response.json();
+  }
+
+  async function fetchMyDiabbyAll(token: string): Promise<MyDiabbyGlycemiaEntry[]> {
+    const response = await fetch("https://app.mydiabby.com/api/data", {
+      method: "GET",
+      headers: { Accept: "application/json, text/plain, */*", Authorization: `Bearer ${token}`, "X-locale": "fr" },
+      credentials: "include",
+    });
+    if (!response.ok) throw new Error("Erreur lors de la récupération des données MyDiabby");
+    const data = await response.json();
+    return data.data?.glycemia || [];
+  }
+
   // Handler global pour l'envoi groupé
   // 5 envois simultanés : 20 provoquait des refus ponctuels de MyDiabby.
   const CONCURRENCY = 5;
@@ -379,6 +424,7 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
           sendBolus ? fetchMyDiabbyBolus(token) : Promise.resolve([] as MyDiabbyGlycemiaEntry[]),
           sendBasal ? fetchMyDiabbyBasal(token) : Promise.resolve([] as MyDiabbyGlycemiaEntry[]),
         ]);
+      const mydiabbyAll = sendEvents ? await fetchMyDiabbyAll(token) : [];
 
       // Pré-filtrage : ne garder que ce qui n'existe pas déjà côté MyDiabby
       const glycemiaToSend = sendGlycemia && data
@@ -400,7 +446,17 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
         (item) => !mydiabbyBasalList.some((r: MyDiabbyGlycemiaEntry) => sameAs(item, r, "basal"))
       );
 
-      totalSteps = glycemiaToSend.length + bolusToSend.length + basalToSend.length;
+      const eventsToSend = (sendEvents && treatments ? loopEvents(treatments) : []).filter(
+        (ev) =>
+          !mydiabbyAll.some(
+            (r) =>
+              r.date === ev.date &&
+              r.time === ev.time &&
+              [r.meal?.description, r.sport?.description, r.context?.description].includes(ev.description)
+          )
+      );
+
+      totalSteps = glycemiaToSend.length + bolusToSend.length + basalToSend.length + eventsToSend.length;
       if (totalSteps === 0) {
         setStatus("Aucune donnée à envoyer (tout est déjà synchronisé).");
         setLoading(false);
@@ -444,6 +500,15 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
           );
         });
       }
+      // 4. Repas / sport / remarques (évènements de boucle)
+      if (eventsToSend.length > 0) {
+        await runWithConcurrency(eventsToSend, CONCURRENCY, async (ev) => {
+          await attempt(`${ev.kind === "meal" ? "Repas" : ev.kind === "sport" ? "Sport" : "Remarque"} ${ev.date} ${ev.time}`, () =>
+            sendEventToMyDiabby(token, ev)
+          );
+        });
+      }
+
       const sent = totalSteps - failures.length;
       setStatus(
         (failures.length === 0
@@ -572,6 +637,9 @@ export function SendToMyDiabbyCard({ data, treatments, isDemo = false }: { data:
                           </label>
                           <label className="flex items-center gap-2">
                             <Checkbox checked={sendBasal} onCheckedChange={v => setSendBasal(!!v)} /> {t('SendToMyDiabbyCard.basalLabel')}
+                          </label>
+                          <label className="flex items-center gap-2">
+                            <Checkbox checked={sendEvents} onCheckedChange={v => setSendEvents(!!v)} /> Repas, dérogations et cibles temporaires
                           </label>
                         </div>
                         <DialogFooter>
