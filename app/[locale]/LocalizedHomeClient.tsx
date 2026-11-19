@@ -141,7 +141,7 @@ function LocalizedHomeClientContent({ locale }: LocalizedHomeClientProps) {
     includeCharts: boolean;
     includeVariabilityChart: boolean;
   }) => {
-    generateNightscoutPdf(
+    void generateNightscoutPdf(
       {
         data,
         treatments,

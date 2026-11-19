@@ -141,7 +141,7 @@ export function LoopDayChart({
     .map((s, i) => `${i ? "L" : "M"}${x(s.t)},${yIo(s.iob as number)}`)
     .join("");
   const targetPath = model.status
-    .filter((s) => s.target !== null)
+    .filter((s) => s.target !== null && (s.target as number) >= 60)
     .map((s, i) => `${i ? "L" : "M"}${x(s.t)},${yGl(s.target as number)}`)
     .join("");
 

@@ -2,6 +2,9 @@ import jsPDF from "jspdf";
 import { format } from "date-fns";
 import { DateRange } from "react-day-picker";
 import { NightscoutEntry, NightscoutTreatment, NightscoutProfile } from '@/types/nightscout';
+import { buildDay, LoopStatus } from '@/lib/loopView';
+import { kind } from '@/lib/trioAggregation';
+import { drawLoopDayPage } from '@/lib/pdfLoopDay';
 
 interface PatientInfo {
   nom: string;
@@ -48,6 +51,8 @@ interface StatisticsData {
   totalBolus: number;
   realBasalPerDay: number;
   totalInsuline: number;
+  totalSMB: number;
+  totalManual: number;
 }
 
 export class NightscoutPdfGenerator {
@@ -58,6 +63,27 @@ export class NightscoutPdfGenerator {
   private date: DateRange | undefined;
   private t: (key: string) => string;
   private glucoseUnit: GlucoseUnit;
+  /** État de la boucle (IOB, cible…) par jour, clé = début du jour (ms). */
+  private statuses: Map<number, LoopStatus[]> = new Map();
+
+  public setStatuses(m: Map<number, LoopStatus[]>) {
+    this.statuses = m;
+  }
+
+  /** Jours (début, ms) couverts par la période. */
+  public days(): number[] {
+    if (!this.date?.from || !this.date?.to) return [];
+    const out: number[] = [];
+    const d = new Date(this.date.from); d.setHours(0, 0, 0, 0);
+    const end = new Date(this.date.to); end.setHours(0, 0, 0, 0);
+    for (; d.getTime() <= end.getTime(); d.setDate(d.getDate() + 1)) out.push(d.getTime());
+    return out;
+  }
+
+  private dayModel(dayStart: number) {
+    return buildDay(this.data, this.treatments, dayStart, this.statuses.get(dayStart) || [],
+      (ms) => this.getBasalProfileValueAt(ms, this.profil, new Date(dayStart)));
+  }
 
   private convertGlucose(value: number): number {
     if (this.glucoseUnit === 'mmol/L') {
@@ -113,56 +139,10 @@ export class NightscoutPdfGenerator {
   }
 
   private computeRealBasalPerDay(): number {
-    if (!this.profil || !this.date?.from || !this.date?.to) return 0;
-    
-    const dayMs = 24 * 60 * 60 * 1000;
-    const fromDay = new Date(this.date.from);
-    fromDay.setHours(0, 0, 0, 0);
-    const toDay = new Date(this.date.to);
-    toDay.setHours(0, 0, 0, 0);
-    const nbDays = Math.round((toDay.getTime() - fromDay.getTime()) / dayMs) + 1;
-    
-    let totalBasal = 0;
-    for (let d = 0; d < nbDays; d++) {
-      const day = new Date(fromDay.getTime() + d * dayMs);
-      // Récupérer tous les temp basal de la journée
-      const dayStart = new Date(day); 
-      dayStart.setHours(0, 0, 0, 0);
-      const dayEnd = new Date(day); 
-      dayEnd.setHours(23, 59, 59, 999);
-      
-      const tempBasals = this.treatments
-        .filter((t: NightscoutTreatment) => 
-          t.eventType === "Temp Basal" && 
-          t.timestamp && 
-          t.duration && 
-          t.rate && 
-          new Date(t.timestamp) >= dayStart && 
-          new Date(t.timestamp) <= dayEnd
-        )
-        .map((t: NightscoutTreatment) => ({
-          start: new Date(t.timestamp).getTime(),
-          end: new Date(t.timestamp).getTime() + (t.duration || 0) * 60000,
-          rate: t.rate || 0
-        }));
-      
-      // Pour chaque minute de la journée
-      let delivered = 0;
-      for (let min = 0; min < 1440; min++) {
-        const ts = dayStart.getTime() + min * 60000;
-        // Chercher un temp basal actif
-        const temp = tempBasals.find(tb => ts >= tb.start && ts < tb.end);
-        let rate = 0;
-        if (temp) {
-          rate = temp.rate;
-        } else {
-          rate = this.getBasalProfileValueAt(ts, this.profil, day);
-        }
-        delivered += rate / 60; // U/min
-      }
-      totalBasal += delivered;
-    }
-    return totalBasal / nbDays;
+    const withData = new Set(this.data.map((e) => new Date(e.date).setHours(0, 0, 0, 0)));
+    const days = this.days().filter((d) => withData.has(d));
+    if (!days.length) return 0;
+    return days.reduce((sum, d) => sum + this.dayModel(d).totals.basal, 0) / days.length;
   }
 
   private calculateStatistics(): StatisticsData {
@@ -180,7 +160,7 @@ export class NightscoutPdfGenerator {
       (t) => t.eventType && t.eventType.toLowerCase().includes("site change")
     ).length;
     const nbCapteur = this.treatments.filter(
-      (t) => t.eventType && t.eventType.toLowerCase().includes("sensor change")
+      (t) => t.eventType && /sensor (change|start)/i.test(t.eventType)
     ).length;
 
     // Valeurs glycémiques
@@ -262,6 +242,10 @@ export class NightscoutPdfGenerator {
       .filter((t) => t.insulin && t.eventType && t.eventType.toLowerCase().includes("bolus"))
       .reduce((sum, t) => sum + (t.insulin || 0), 0);
 
+    const totalSMB = this.treatments
+      .filter((t) => t.insulin && kind(t) === "SMB")
+      .reduce((sum, t) => sum + (t.insulin || 0), 0);
+    const totalManual = totalBolus - totalSMB;
     const realBasalPerDay = this.computeRealBasalPerDay();
     const totalInsuline = (totalBolus / jours) + realBasalPerDay;
 
@@ -290,7 +274,9 @@ export class NightscoutPdfGenerator {
       totalGlucides,
       totalBolus,
       realBasalPerDay,
-      totalInsuline
+      totalInsuline,
+      totalSMB,
+      totalManual
     };
   }
 
@@ -523,6 +509,14 @@ export class NightscoutPdfGenerator {
     this.doc.text(this.t('PdfGeneration.averageBolusPerDay'), 22, y);
     this.doc.text(`${(stats.totalBolus / stats.jours).toFixed(1)} ${this.t('PdfGeneration.units')}`, 90, y);
     y += 6;
+    if (stats.totalSMB > 0) {
+      this.doc.text("   dont SMB (boucle)", 22, y);
+      this.doc.text(`${(stats.totalSMB / stats.jours).toFixed(1)} ${this.t('PdfGeneration.units')}`, 90, y);
+      y += 6;
+      this.doc.text("   dont bolus manuels", 22, y);
+      this.doc.text(`${(stats.totalManual / stats.jours).toFixed(1)} ${this.t('PdfGeneration.units')}`, 90, y);
+      y += 6;
+    }
     
     this.doc.text(this.t('PdfGeneration.averageBasalPerDay'), 22, y);
     this.doc.text(`${stats.realBasalPerDay.toFixed(1)} ${this.t('PdfGeneration.units')}`, 90, y);
@@ -531,27 +525,14 @@ export class NightscoutPdfGenerator {
   }
 
   private addGlucoseTrendPage(): void {
-    if (!this.date?.from || !this.date?.to) return;
-    
-    // Grouper les données par jour
-    const dayData = new Map<string, NightscoutEntry[]>();
-    
-    this.data.forEach(entry => {
-      if (!entry.sgv && !entry.glucose) return;
-      const dateKey = format(new Date(entry.date), "yyyy-MM-dd");
-      if (!dayData.has(dateKey)) {
-        dayData.set(dateKey, []);
-      }
-      dayData.get(dateKey)!.push(entry);
-    });
-    
-    // Trier les jours
-    const sortedDays = Array.from(dayData.keys()).sort();
-    
-    // Créer une page pour chaque jour
-    sortedDays.forEach((dateKey, index) => {
-      this.addSingleDayChart(dateKey, dayData.get(dateKey)!, index === 0);
-    });
+    const withData = new Set(this.data.map((e) => new Date(e.date).setHours(0, 0, 0, 0)));
+    for (const d of this.days().filter((d) => withData.has(d))) {
+      this.doc.addPage();
+      drawLoopDayPage(this.doc, this.dayModel(d), {
+        unit: this.glucoseUnit,
+        convert: (v) => this.convertGlucose(v),
+      });
+    }
   }
 
   private addSingleDayChart(dateKey: string, entries: NightscoutEntry[], isFirstChart: boolean): void {
@@ -1234,7 +1215,7 @@ export class NightscoutPdfGenerator {
     this.doc.text(`Zone cible (${this.glucoseUnit === 'mmol/L' ? '3.9-10.0 mmol/L' : '70-180 mg/dL'})`, x + 20, y + 2);
   }
 
-  public generate(infos: PatientInfo): void {
+  public generate(infos: PatientInfo, target?: Window | null): void {
     const stats = this.calculateStatistics();
     
     let y = this.addHeader();
@@ -1255,17 +1236,48 @@ export class NightscoutPdfGenerator {
     }
     
     // Ouvrir le PDF dans un nouvel onglet
-    window.open(this.doc.output("bloburl"), "_blank");
+    const blobUrl = String(this.doc.output("bloburl"));
+    if (target && !target.closed) target.location.href = blobUrl;
+    else window.open(blobUrl, "_blank");
   }
 }
 
 // Fonction utilitaire pour générer le PDF
-export function generateNightscoutPdf(
+export async function generateNightscoutPdf(
   data: PdfGenerationData,
   patientInfo: PatientInfo,
   translateFunction: (key: string) => string,
   glucoseUnit: GlucoseUnit = 'mg/dL'
-): void {
+): Promise<void> {
+  // Fenêtre ouverte tout de suite (sinon bloquée comme pop-up après le chargement asynchrone)
+  const target = window.open("", "_blank");
+  target?.document.write("<p style='font-family:sans-serif'>Génération du rapport en cours…</p>");
   const generator = new NightscoutPdfGenerator(data, translateFunction, glucoseUnit);
-  generator.generate(patientInfo);
+  if (patientInfo.includeCharts) {
+    const url = localStorage.getItem("nightscoutUrl");
+    const token = localStorage.getItem("nightscoutToken") || "";
+    const statuses = new Map<number, LoopStatus[]>();
+    if (url && url !== "demo") {
+      const days = generator.days();
+      let i = 0;
+      const worker = async () => {
+        while (i < days.length) {
+          const d = days[i++];
+          try {
+            const res = await fetch("/api/nightscout/devicestatus", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ url, token, from: d, to: d + 24 * 3600_000 }),
+            });
+            if (res.ok) statuses.set(d, await res.json());
+          } catch {
+            // état de boucle indisponible pour ce jour : la page est générée sans IOB
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: 4 }, worker));
+    }
+    generator.setStatuses(statuses);
+  }
+  generator.generate(patientInfo, target);
 }
